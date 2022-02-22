@@ -1,10 +1,12 @@
-from agent import SACAgent
-from argments import get_args
 import gym
+from agent import SAC
+from argments import get_args
+
 
 if __name__ == '__main__':
-    env = gym.make('HalfCheetah-v2')
+    env = gym.make('Pendulum-v0')
     args = get_args()
-    agent = SACAgent(env=env, args=args)
+    agent = SAC(env,args)
+
     agent.learn()
     env.close()

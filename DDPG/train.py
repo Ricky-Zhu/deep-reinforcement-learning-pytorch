@@ -1,12 +1,12 @@
+from agent import DDPGAgent
 import gym
-from agent import PPOAgent
 from argments import get_args
 
+
 if __name__ == '__main__':
-    env = gym.make('Acrobot-v1')
+    env = gym.make('HalfCheetah-v2')
     args = get_args()
-    agent = PPOAgent(env, args)
-    agent.load()
+    agent = DDPGAgent(env, args)
     agent.learn()
 
     env.close()

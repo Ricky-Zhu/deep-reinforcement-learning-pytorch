@@ -1,84 +1,49 @@
-import torch
+import  torch
 import torch.nn as nn
 from torch.nn import functional as F
-import numpy as np
-from torch.distributions.normal import Normal
+from math import sqrt
 
 
-class Actor(nn.Module):
-    def __init__(self, obs_dim, action_dim):
-        super(Actor, self).__init__()
-        self.fc1 = nn.Linear(obs_dim, 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.mean = nn.Linear(256, action_dim)
-        self.log_std = nn.Parameter(torch.zeros([1, action_dim]))
+def initialization_fc(p):
+    if isinstance(p,nn.Linear):
+        p.weight.data.uniform_(-1/sqrt(p.weight.shape[1]),1/sqrt(p.weight.shape[1]))
+        p.bias.data.uniform_(-1/sqrt(p.weight.shape[1]),1/sqrt(p.weight.shape[1]))
 
-    def forward(self, x):
-        if len(x.shape) < 2:
-            x = x[np.newaxis, :]
+class Critic(nn.Module):
+    def __init__(self,input_dim,hidden_size,action_dim):
+        super(Critic,self).__init__()
+        self.fc1 = nn.Linear(input_dim+action_dim,hidden_size)
+        self.fc2 = nn.Linear(hidden_size,hidden_size)
+        self.q_value = nn.Linear(hidden_size,1)
+
+        # initialize weight and bias
+        self.apply(initialization_fc)
+
+    def forward(self,s,a):
+        x = torch.cat([s,a],dim=1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.q_value(x)
+        return x
+
+class tanh_gaussian_actor(nn.Module):
+    def __init__(self,input_dim,action_dim,hidden_size,log_std_min,log_std_max):
+        super(tanh_gaussian_actor, self).__init__()
+        self.fc1 = nn.Linear(input_dim,hidden_size)
+        self.fc2 = nn.Linear(hidden_size,hidden_size)
+        self.mean = nn.Linear(hidden_size,action_dim)
+        self.log_std = nn.Linear(hidden_size,action_dim)
+
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
+
+        self.apply(initialization_fc)
+
+    def forward(self,x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         mean = self.mean(x)
-        log_std = self.log_std.expand_as(mean)
-        log_std = torch.clamp(log_std, -20., 2.)
-        std = torch.exp(log_std)
-        return mean, std
+        log_std = self.log_std(x)
+        log_std = log_std.clamp(self.log_std_min,self.log_std_max)
 
-    def sample_action(self, x):
-        if len(x.shape) < 2:
-            x = x[np.newaxis, :]
-        mean, std = self.forward(x)
-        dist = Normal(mean, std)
-        pre_tanh_action = dist.rsample()
-
-        action = torch.tanh(pre_tanh_action)
-
-        log_probs = dist.log_prob(pre_tanh_action).sum(1, keepdims=True) - \
-                    torch.log(1 - action * action + 1e-6).sum(1, keepdims=True)
-
-        return pre_tanh_action, action, log_probs
-
-    def eval_action(self, obs, actions):
-        mean, std = self.forward(obs)
-        dist = Normal(mean, std)
-        log_probs = dist.log_prob(actions)
-        return log_probs
-
-
-class QNet(nn.Module):
-    def __init__(self, obs_dim, action_dim, init_method=None):
-        super(QNet, self).__init__()
-        self.fc1 = nn.Linear(obs_dim + action_dim, 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.q = nn.Linear(256, 1)
-
-        if init_method:
-            for layer in self.modules():
-                if isinstance(layer, nn.Linear):
-                    nn.init.orthogonal_(layer.weight, np.sqrt(2))
-                    nn.init.zeros_(layer.bias)
-
-    def forward(self, obs, action):
-        x = torch.cat([obs, action], dim=1)
-        if len(x.shape) < 2:
-            x = x[np.newaxis, :]
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        q = self.q(x)
-        return q
-
-
-class ValueNet(nn.Module):
-    def __init__(self, obs_dim):
-        super(ValueNet, self).__init__()
-        self.fc1 = nn.Linear(obs_dim, 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.v = nn.Linear(256, 1)
-
-    def forward(self, x):
-        if len(x.shape) < 2:
-            x = x[np.newaxis, :]
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        v = self.v(x)
-        return v
+        return (mean,torch.exp(log_std))

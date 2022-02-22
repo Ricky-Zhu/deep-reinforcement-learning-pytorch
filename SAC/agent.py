@@ -1,146 +1,179 @@
-from models import QNet, Actor, ValueNet
-import torch
-from torch.distributions.normal import Normal
 import numpy as np
+from models import Critic, tanh_gaussian_actor
+from utils import get_action_info, ReplayBuffer, to_tensor
+import torch
+import os
+import numpy
 import copy
-from utilities import Buffer
+from tensorboardX import SummaryWriter
+import datetime
 
 
-class SACAgent:
-    def __init__(self, args, env):
+
+class SAC:
+    def __init__(self, env, args):
         self.env = env
         self.args = args
 
         self.action_dim = self.env.action_space.shape[0]
         self.obs_dim = self.env.observation_space.shape[0]
-        self.action_max = self.env.action_space.high
-        self.device = self.args.device
-        self.alpha = 0.2
 
-        # set the networks
-        self.q1 = QNet(obs_dim=self.obs_dim, action_dim=self.action_dim).to(self.device)
-        self.q2 = QNet(obs_dim=self.obs_dim, action_dim=self.action_dim, init_method=True).to(self.device)
+        self.q1 = Critic(self.obs_dim, self.args.hidden_size, self.action_dim)
+        self.q2 = Critic(self.obs_dim, self.args.hidden_size, self.action_dim)
 
-        self.value_net = ValueNet(obs_dim=self.obs_dim).to(self.device)
-        self.target_value_net = copy.deepcopy(self.value_net).to(self.device)
+        self.target_q1 = copy.deepcopy(self.q1)
+        self.target_q2 = copy.deepcopy(self.q2)
 
-        self.actor = Actor(obs_dim=self.obs_dim, action_dim=self.action_dim).to(self.device)
+        self.actor_net = tanh_gaussian_actor(self.obs_dim, self.action_dim, self.args.hidden_size,
+                                             self.args.log_std_min, self.args.log_std_max)
 
-        # set the optimizers
-        self.q1_optim = torch.optim.Adam(self.q1.parameters(), lr=self.args.lr)
-        self.q2_optim = torch.optim.Adam(self.q2.parameters(), lr=self.args.lr)
-        self.v_optim = torch.optim.Adam(self.value_net.parameters(), lr=self.args.lr)
-        self.a_optim = torch.optim.Adam(self.actor.parameters(), lr=self.args.lr)
+        self.q1_optim = torch.optim.Adam(self.q1.parameters(), lr=self.args.q_lr)
+        self.q2_optim = torch.optim.Adam(self.q2.parameters(), lr=self.args.q_lr)
+        self.actor_optim = torch.optim.Adam(self.actor_net.parameters(), lr=self.args.actor_lr)
 
-        # set the replay buffer
-        self.buffer = Buffer(buffer_size=self.args.buffer_size, batch_size=self.args.batch_size)
+        self.target_entropy = -np.prod(self.env.action_space.shape).item()
+        self.log_alpha = torch.zeros(1, requires_grad=True)
 
-        self.env_step = 0
+        self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=self.args.actor_lr)
+
+        self.buffer = ReplayBuffer(max_size=self.args.buffer_size)
+
+        self.action_max = self.env.action_space.high[0]
+        self.global_step = 0
+
+        # set the logger
+        log_dir = os.path.join(self.args.log_path,self.env.spec._env_name)
+
+        if os.path.exists(log_dir):
+            os.makedirs(log_dir)
+
+        self.writer = SummaryWriter(log_dir=log_dir)
 
     def learn(self):
-        obs = self.env.reset()
-        for i in range(self.args.pre_training_steps):
-            with torch.no_grad():
-                obs_tensor = torch.tensor(obs, dtype=torch.float32).to(self.device)
-                mean, std = self.actor(obs_tensor)
-                action = self.select_action(mean, std)
-
-            next_obs, reward, done, _ = self.env.step(action * self.action_max)
-            self.buffer.add((obs, action, reward, next_obs, done))
-            obs = next_obs
-            if done:
-                obs = self.env.reset()
-
-        for i in range(self.args.iterations):
+        self._init_exploration()
+        for episode in range(self.args.n_episodes):
             obs = self.env.reset()
-            while True:
+            for _ in range(self.args.episode_max_steps):
                 with torch.no_grad():
-                    obs_tensor = torch.tensor(obs, dtype=torch.float32).to(self.device)
-                    mean, std = self.actor(obs_tensor)
-                    action = self.select_action(mean, std)
+                    obs_tensor = to_tensor(obs)
+                    pi = self.actor_net(obs_tensor)
+                    action = get_action_info(pi).select_action()
+                    action = action.cpu().numpy()[0]
 
-                next_obs, reward, done, _ = self.env.step(action * self.action_max)
+                next_obs, reward, done, _ = self.env.step(self.action_max * action)
+                self.buffer.store(obs, action, reward, next_obs, done)
 
-                self.buffer.add((obs, action, reward, next_obs, float(done)))
-                self.update()
+                self.global_step += 1
+                self._update_networks()
+
+                if self.global_step % self.args.eval_every_steps == 0:
+                    eval_reward = self._evaluation()
+                    self.writer.add_scalar('evaluation_reward',eval_reward,self.global_step)
+                    print('global_steps:{}, evaluation_reward:{}'.format(self.global_step, eval_reward))
+
                 obs = next_obs
-                if self.env_step % self.args.evaluation_steps == 0:
-                    eval_rew = self.evaluation()
-                    print('environment step:{}, eval_rew:{}'.format(self.env_step, eval_rew))
                 if done:
-                    break
+                    obs = self.env.reset()
+        self.writer.close()
 
-    def update(self):
-        b_s, b_a, b_r, b_s_, b_done = self.buffer.sample()
-        b_s = torch.tensor(b_s, dtype=torch.float32).to(self.device)
-        b_a = torch.tensor(b_a, dtype=torch.float32).to(self.device)
-        b_r = torch.tensor(b_r, dtype=torch.float32).to(self.device)
-        b_s_ = torch.tensor(b_s_, dtype=torch.float32).to(self.device)
-        b_done = torch.tensor(b_done, dtype=torch.float32).to(self.device)
+    def _update_networks(self):
+        batch_s, batch_a, batch_r, batch_s_, batch_done = self.buffer.sample(self.args.batch_size)
+        batch_s = to_tensor(batch_s)
+        batch_a = to_tensor(batch_a)
+        batch_r = to_tensor(batch_r.reshape(-1,1))
+        batch_s_ = to_tensor(batch_s_)
+        batch_done = to_tensor(batch_done.reshape(-1,1))
 
-        # update the value net
+        # update alpha
+        pis = self.actor_net(batch_s)
+        actions_info = get_action_info(pis)
+        actions, pre_tanh_values = actions_info.select_action(reparam=True)
+        log_probs = actions_info.get_log_prob(actions, pre_tanh_values)
+
+        alpha_loss = -(self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
+        self.alpha_optim.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optim.step()
+
+        alpha = torch.exp(self.log_alpha)
+
+        # update the actor
+        actor_loss = (alpha * log_probs - torch.min(self.q1(batch_s, actions), self.q2(batch_s, actions))).mean()
+        self.actor_optim.zero_grad()
+        actor_loss.backward()
+        self.actor_optim.step()
+
+        # update the q nets
+        qf1_value = self.q1(batch_s, batch_a)
+        qf2_value = self.q2(batch_s, batch_a)
+
         with torch.no_grad():
-            _, actions, log_probs = self.actor.sample_action(b_s)
-            q_values = torch.min(self.q1(b_s, actions), self.q2(b_s, actions))
-            v_target = q_values - self.alpha * log_probs
-        real_values = self.value_net(b_s)
-        v_loss = (real_values - v_target).pow(2).mean()
-        self.v_optim.zero_grad()
-        v_loss.backward()
-        self.v_optim.step()
+            pis_next = self.actor_net(batch_s_)
+            next_action_info = get_action_info(pis_next)
+            action_next, next_pre_tanh_values = next_action_info.select_action(reparam=True)
+            log_probs_next = next_action_info.get_log_prob(action_next, next_pre_tanh_values)
+            target_q_next = torch.min(self.target_q1(batch_s_, action_next),
+                                      self.target_q2(batch_s_, action_next)) - alpha * log_probs_next
 
-        # update the q net
-        with torch.no_grad():
-            q_target = b_r + self.args.gamma * self.target_value_net(b_s_) * (1. - b_done)
-        q1_loss = (self.q1(b_s, b_a) - q_target).pow(2).mean()
-        q2_loss = (self.q2(b_s, b_a) - q_target).pow(2).mean()
+            target_q_values = batch_r + self.args.gamma * (1 - batch_done) * target_q_next
+
+        qf1_loss = (qf1_value - target_q_values).pow(2).mean()
+        qf2_loss = (qf2_value - target_q_values).pow(2).mean()
 
         self.q1_optim.zero_grad()
-        q1_loss.backward()
+        qf1_loss.backward()
         self.q1_optim.step()
 
         self.q2_optim.zero_grad()
-        q2_loss.backward()
+        qf2_loss.backward()
         self.q2_optim.step()
 
-        # update the actor
-        pre_tanh_actions, repara_actions, repa_log_probs = self.actor.sample_action(b_s)
-        repa_q_values = torch.min(self.q1(b_s, repara_actions), self.q2(b_s, repara_actions))
-        a_loss = (self.alpha * repa_log_probs - repa_q_values).mean()
-        self.a_optim.zero_grad()
-        a_loss.backward()
-        self.a_optim.step()
+        self._soft_update_target_network(self.target_q1, self.q1)
+        self._soft_update_target_network(self.target_q2, self.q2)
 
-        # sof update the target v net
-        self.soft_update_networks(self.target_value_net, self.value_net)
+        # log the these losses
+        self.writer.add_scalar('loss/q1_loss',qf1_loss.item(),self.global_step)
+        self.writer.add_scalar('loss/q2_loss', qf2_loss.item(), self.global_step)
+        self.writer.add_scalar('loss/actor_loss', actor_loss.item(), self.global_step)
+        self.writer.add_scalar('loss/alpha_loss', alpha_loss.item(), self.global_step)
+        self.writer.add_scalar('alpha', alpha.item(), self.global_step)
 
-        self.env_step += 1
 
-    def evaluation(self):
-        """only run for one seed"""
-        self.env.seed(1)
-        self.actor.eval()
+    def _evaluation(self):
+        self.actor_net.eval()
+        self.env.seed(self.args.seed * 2)
         obs = self.env.reset()
-        episode_reward = 0
+        episode_reward = 0.
         while True:
             with torch.no_grad():
-                obs_tensor = torch.tensor(obs, dtype=torch.float32).to(self.device)
-                mean, _ = self.actor(obs_tensor)
-                action = torch.tanh(mean).cpu().numpy().squeeze()
-            next_obs, reward, done, _ = self.env.step(action * self.action_max)
+                obs_tensor = to_tensor(obs)
+                pi = self.actor_net(obs_tensor)
+                action = get_action_info(pi).select_action()
+                action = action.cpu().numpy()[0]
+
+            next_obs, reward, done, _ = self.env.step(self.action_max * action)
             episode_reward += reward
             obs = next_obs
             if done:
                 break
-        self.actor.train()
+        self.actor_net.train()
         return episode_reward
 
-    @staticmethod
-    def select_action(mean, std):
-        action = Normal(mean, std).sample()
-        action = torch.tanh(action)
-        return action.cpu().numpy().squeeze()
+    def _init_exploration(self):
+        obs = self.env.reset()
+        for _ in range(self.args.init_exploration_steps):
+            with torch.no_grad():
+                obs_tensor = to_tensor(obs)
+                pi = self.actor_net(obs_tensor)
+                action = get_action_info(pi).select_action()
+                action = action.cpu().numpy()[0]
 
-    def soft_update_networks(self, target, source):
-        for target_param, source_param in zip(target.parameters(), source.parameters()):
-            target_param.data.copy_((1 - self.args.polyak) * source_param.data + self.args.polyak * target_param.data)
+            next_obs, reward, done, _ = self.env.step(self.action_max * action)
+            self.buffer.store(obs, action, reward, next_obs, done)
+            obs = next_obs
+            if done:
+                obs = self.env.reset()
+
+    def _soft_update_target_network(self, target, source):
+        for target_param, param in zip(target.parameters(), source.parameters()):
+            target_param.data.copy_((1 - self.args.polyak) * param.data + self.args.polyak * target_param.data)
